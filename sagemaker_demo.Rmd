@@ -1,0 +1,347 @@
+---
+title: "Sagemaker Demo"
+author: "Gagandeep Singh"
+date: '2022-11-28'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# set repo to bionic
+getOption("repos")
+options(repos = c(REPO_NAME = "https://packagemanager.rstudio.com/cran/__linux__/bionic/latest"))
+
+library(tidyverse)
+library(tidymodels)
+library(reticulate)
+library(DT)
+library(knitr)
+library(aws.s3)
+library(pROC)
+library(glue)
+library(vetiver)
+library(pins)
+library(paws)
+# to get access credentials
+library(aws.ec2metadata)
+
+
+```
+
+## Input data for analysis
+
+
+```{r input_data}
+
+churn <- read_csv(file = "dataset/churn.txt", col_names = TRUE, show_col_types = FALSE)
+
+kable(churn[1:5,], caption = "Customer churn in a cellular company")
+
+```
+
+## Exploring data
+
+
+```{r data_eda}
+
+
+churn = select(churn, -c("Phone", "Day Charge", "Eve Charge", "Night Charge", "Intl Charge"))
+
+churn <- rename(churn, "intlplan" = "Int'l Plan")
+churn <- rename(churn, "churn" = "Churn?")
+
+
+ggplot(churn, aes(x = churn, fill = intlplan)) +  geom_bar() + theme_classic()
+
+```
+
+```{r data_eda_2}
+
+hist(churn$"CustServ Calls"[which(churn$churn == "True.")], col = 'red', breaks = 15, ylim = c(0,600), main = "Churn = True", xlab = "Customer Service Calls")
+
+
+```
+
+```{r data_eda_3}
+
+hist(churn$"CustServ Calls"[which(churn$churn == "False.")], col = 'blue', breaks = 15, ylim = c(0,600), main = "Churn = False", xlab = "Customer Service Calls")
+
+
+```
+```{r data_eda_4}
+
+#Changing target variable churn into dummy variable and keeping just True column while dropping False
+churn <- churn %>% mutate(dummy=1) %>% spread(key="churn",value=dummy, fill=0)
+churn <- subset(churn, select = -c(False.))
+churn <- rename(churn, "churn" = True.)
+
+#Making the target variable "churn" as the first column as XGBoost expects the data to be in this format
+churn <- churn %>% select("churn", everything())
+
+#Transforming intlplan (international plan) to dummy, dropping resulting "no" variable and renaming "yes" using dplyr's rename method
+churn <- churn %>% mutate(dummy=1) %>% spread(key="intlplan",value=dummy, fill=0)
+churn <- subset(churn, select = -c(no))
+churn <- rename(churn, "intlplan" = yes)
+
+#Transforming VMaill plan to dummy, dropping resulting "no" variable and renaming "yes" using dplyr's rename method
+churn <- churn %>% mutate(dummy=1) %>% spread(key="VMail Plan",value=dummy, fill=0)
+churn <- subset(churn, select = -c(no))
+churn <- rename(churn, "VMail plan" = yes)
+
+#Transforming variable "State" into dummy variables
+churn <- churn %>% mutate(dummy=1) %>% spread(key="State",value=dummy, fill=0)
+head(churn)
+
+```
+
+```{r data_test_train_split}
+
+churn_train <- churn %>% sample_frac(size = 0.7)
+churn <- anti_join(churn, churn_train)
+
+churn_test <- churn %>% sample_frac(size = 0.5)
+churn_valid <- anti_join(churn, churn_test)
+
+write_csv(churn_train, 'dataset/churn_train.csv', col_names = FALSE)
+write_csv(churn_valid, 'dataset/churn_valid.csv', col_names = FALSE)
+# Remove target from test
+write_csv(churn_test[-1], 'dataset/churn_test.csv', col_names = FALSE)
+
+
+```
+
+## Working with Sagemker Python SDK
+
+```{r sagemaker_setup}
+
+library(reticulate)
+sagemaker <- import('sagemaker')
+session <- sagemaker$Session()
+bucket <- session$default_bucket()
+role_arn <- sagemaker$get_execution_role()
+print(role_arn)
+print(bucket)
+
+```
+```{r data_upload_s3}
+
+s3_train <- session$upload_data(path = 'dataset/churn_train.csv', bucket = bucket, key_prefix = 'r_example/data')
+s3_valid <- session$upload_data(path = 'dataset/churn_valid.csv', bucket = bucket, key_prefix = 'r_example/data')
+s3_test <- session$upload_data(path = 'dataset/churn_test.csv',   bucket = bucket, key_prefix = 'r_example/data')
+
+```
+
+```{r data_download_s3}
+
+# native R to read this dataset
+library(aws.s3)
+# to get access credentials
+library(aws.ec2metadata)
+df_s3 <- s3read_using(FUN = read.csv, object = "r_example/data/churn_train.csv", bucket = bucket)
+head(df_s3)
+
+
+```
+
+
+
+## Sagemaker Modelling
+
+Specifying the training and validation data channels for model training
+
+```{r}
+
+s3_train_input <- sagemaker$inputs$TrainingInput(s3_data = s3_train, content_type = 'csv')
+s3_valid_input <- sagemaker$inputs$TrainingInput(s3_data = s3_valid, content_type = 'csv')
+input_data <- list('train' = s3_train_input, 'validation' = s3_valid_input)
+
+```
+
+Using Sagemaker's builtin XGBoost model container for model training
+
+```{r}
+
+container <- sagemaker$image_uris$retrieve(framework='xgboost', region= session$boto_region_name, version='latest')
+cat('XGBoost Container Image URL: ', container)
+s3_output <- paste0('s3://', bucket, '/r_example/output')
+
+
+estimator <- sagemaker$estimator$Estimator(image_uri = container,
+                                           role = role_arn,
+                                           instance_count = 1L,
+                                           instance_type = 'ml.m5.xlarge',
+                                           input_mode = 'File',
+                                           output_path = s3_output)
+
+estimator$set_hyperparameters(eval_metric='error',
+                              objective='binary:logistic',
+                              num_round=100L)
+
+
+```
+
+Starting the model training job
+
+```{r}
+
+estimator$fit(inputs = input_data, wait=TRUE, logs=TRUE)
+
+```
+Deploying our trained model as a Sagemaker endpoint 
+
+```{r}
+
+model_endpoint <- estimator$deploy(initial_instance_count=1L, instance_type='ml.m4.xlarge')
+model_endpoint$serializer <- sagemaker$serializers$CSVSerializer(content_type='text/csv')
+
+```
+
+making predictions
+
+```{r}
+
+test_sample <- as.matrix(churn_test[-1])
+dimnames(test_sample)[[2]] <- NULL
+predictions_ep <- model_endpoint$predict(test_sample)
+predictions_ep <- str_split(predictions_ep, pattern = ',', simplify = TRUE)
+predictions_ep <- as.numeric(unlist(predictions_ep))
+churn_predictions_ep <- cbind(predicted_churn = predictions_ep, churn_test)
+head(churn_predictions_ep)
+
+```
+
+Plotting the ROC curve
+
+```{r}
+
+roc_churn <- roc(churn_predictions_ep$churn, churn_predictions_ep$predicted_churn)
+auc_churn <- roc_churn$auc
+# Creating ROC plot
+ggroc(roc_churn, colour = 'red', size = 1.3) + ggtitle(paste0('Receiver Operating Characteristics (ROC) Curve ', '(AUC = ', round(auc_churn, digits = 3), ')'))
+
+```
+
+Delete the endpoint when done
+
+```{r}
+
+model_endpoint$delete_endpoint(delete_endpoint_config=TRUE)
+
+```
+
+## Vetiver based workflow
+
+```{r test_lm}
+
+model_lm <-
+    workflow(churn ~ ., linear_reg()) %>%
+    fit(churn_train)
+
+
+model_lm
+
+```
+
+```{r vetiver_create}
+
+v <- vetiver_model(model_lm, "lm_model")
+v
+## manually add paws.storage for now
+v$metadata$required_pkgs <- c(v$metadata$required_pkgs, "paws.storage")
+
+```
+
+## Publish and version model on AWS S3
+
+```{r vetiver_pin}
+
+
+#identifier <- "sagemaker-vetiver-lm"
+#svc <- s3()
+#svc$create_bucket(
+#  Bucket = identifier,
+#  CreateBucketConfiguration = list(LocationConstraint = "us-east-2")
+#)
+
+model_board <- board_s3(bucket = bucket)
+vetiver_pin_write(model_board, v)
+
+```
+## Build Docker container
+
+To create API app files:
+
+```{r vetiver_docker}
+
+vetiver_write_plumber(
+  model_board,
+  "lm_model",
+  type = "class",
+  path = "/invocations",
+  debug = TRUE,
+  file = "plumber.R"
+)
+vetiver_write_docker(v, port = 8080)
+
+```
+
+
+In terminal, in directory with Dockerfile (working directory in this demo):
+
+(May need to do `export PATH=/home/sagemaker-user/.local/bin:$PATH` first)
+
+```{bash}
+
+sm-docker build . --repository sagemaker-vetiver-biv-svm:1.0 --bucket sagemaker-us-east-2-075258722956
+
+```
+
+Be sure to notice/record image URI!
+
+## Deploy image as SageMaker model
+
+```{r vetiver_sm_endpoint}
+
+## set seed here for reproducible identifier
+lm_model_identifier <- glue::glue("vetiver-sagemaker-", ids::adjective_animal(style = "kebab"))
+lm_model_identifier
+sm_model_name <- lm_model_identifier
+endpoint_config <- glue("{lm_model_identifier}-endpoint-config")
+endpoint_config
+
+```
+
+```{r vetiver_sm_deploy}
+library(paws)
+sm <- sagemaker()
+## use image URI from building:
+
+sm$create_model(
+  ModelName = sm_model_name,
+  ExecutionRoleArn = role_arn,
+  PrimaryContainer = list(
+    Image = "075258722956.dkr.ecr.us-east-2.amazonaws.com/sagemaker-vetiver-biv-svm:1.0"
+  )
+)
+
+
+sm$create_endpoint_config(
+  EndpointConfigName = endpoint_config, 
+  ProductionVariants = list(
+    list(
+      VariantName = "AllTraffic",
+      ModelName = sm_model_name,
+      InitialInstanceCount = 1,
+      InstanceType = "ml.t2.medium",
+      InitialVariantWeight = 1
+    )
+  )
+)
+
+sm$create_endpoint(
+  EndpointName = sm_model_name, 
+  EndpointConfigName = endpoint_config
+)
+```
+
