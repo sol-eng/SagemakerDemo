@@ -1,16 +1,15 @@
 ---
 title: "Sagemaker Demo"
 author: "Gagandeep Singh"
-date: '2022-11-28'
+date: '2023-06-02'
 output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
 
 # set repo to bionic
 getOption("repos")
-options(repos = c(REPO_NAME = "https://packagemanager.rstudio.com/cran/__linux__/bionic/latest"))
+options(repos = c(REPO_NAME = "https://packagemanager.posit.co/cran/__linux__/bionic/latest"))
 
 library(tidyverse)
 library(tidymodels)
@@ -26,6 +25,7 @@ library(paws)
 # to get access credentials
 library(aws.ec2metadata)
 
+knitr::opts_chunk$set(echo = TRUE)
 
 ```
 
@@ -36,7 +36,7 @@ library(aws.ec2metadata)
 
 churn <- read_csv(file = "dataset/churn.txt", col_names = TRUE, show_col_types = FALSE)
 
-kable(churn[1:5,], caption = "Customer churn in a cellular company")
+kable(churn[1:10,], caption = "Customer churn in a cellular company")
 
 ```
 
@@ -69,6 +69,7 @@ hist(churn$"CustServ Calls"[which(churn$churn == "False.")], col = 'blue', break
 
 
 ```
+
 ```{r data_eda_4}
 
 #Changing target variable churn into dummy variable and keeping just True column while dropping False
@@ -95,6 +96,7 @@ head(churn)
 
 ```
 
+
 ```{r data_test_train_split}
 
 churn_train <- churn %>% sample_frac(size = 0.7)
@@ -120,10 +122,12 @@ sagemaker <- import('sagemaker')
 session <- sagemaker$Session()
 bucket <- session$default_bucket()
 role_arn <- sagemaker$get_execution_role()
-print(role_arn)
-print(bucket)
+#print(role_arn)
+#print(bucket)
 
 ```
+
+
 ```{r data_upload_s3}
 
 s3_train <- session$upload_data(path = 'dataset/churn_train.csv', bucket = bucket, key_prefix = 'r_example/data')
@@ -132,14 +136,19 @@ s3_test <- session$upload_data(path = 'dataset/churn_test.csv',   bucket = bucke
 
 ```
 
+
 ```{r data_download_s3}
 
-# native R to read this dataset
-library(aws.s3)
-# to get access credentials
-library(aws.ec2metadata)
-df_s3 <- s3read_using(FUN = read.csv, object = "r_example/data/churn_train.csv", bucket = bucket)
-head(df_s3)
+# create paws s3 object
+s3 <- paws::s3()
+
+s3_download <- s3$get_object(
+  Bucket = bucket,
+  Key = 'r_example/data/churn_train.csv'
+)
+
+require(magrittr)
+s3_download$Body %>% rawToChar %>% read.csv(text = .)
 
 
 ```
@@ -183,11 +192,12 @@ estimator$set_hyperparameters(eval_metric='error',
 
 Starting the model training job
 
-```{r}
+```{r echo=FALSE}
 
 estimator$fit(inputs = input_data, wait=TRUE, logs=TRUE)
 
 ```
+
 Deploying our trained model as a Sagemaker endpoint 
 
 ```{r}
@@ -204,6 +214,7 @@ making predictions
 test_sample <- as.matrix(churn_test[-1])
 dimnames(test_sample)[[2]] <- NULL
 predictions_ep <- model_endpoint$predict(test_sample)
+predictions_ep <- as.character(predictions_ep)
 predictions_ep <- str_split(predictions_ep, pattern = ',', simplify = TRUE)
 predictions_ep <- as.numeric(unlist(predictions_ep))
 churn_predictions_ep <- cbind(predicted_churn = predictions_ep, churn_test)
@@ -245,7 +256,7 @@ model_lm
 
 ```{r vetiver_create}
 
-v <- vetiver_model(model_lm, "lm_model")
+v <- vetiver_model(model_lm, "lm-model")
 v
 ## manually add paws.storage for now
 v$metadata$required_pkgs <- c(v$metadata$required_pkgs, "paws.storage")
@@ -256,92 +267,20 @@ v$metadata$required_pkgs <- c(v$metadata$required_pkgs, "paws.storage")
 
 ```{r vetiver_pin}
 
-
-#identifier <- "sagemaker-vetiver-lm"
-#svc <- s3()
-#svc$create_bucket(
-#  Bucket = identifier,
-#  CreateBucketConfiguration = list(LocationConstraint = "us-east-2")
-#)
-
 model_board <- board_s3(bucket = bucket)
 vetiver_pin_write(model_board, v)
 
 ```
-## Build Docker container
 
-To create API app files:
 
-```{r vetiver_docker}
-
-vetiver_write_plumber(
-  model_board,
-  "lm_model",
-  type = "class",
-  path = "/invocations",
-  debug = TRUE,
-  file = "plumber.R"
+```{r vetiver_deploy_sagemaker}
+endpoint <- vetiver_deploy_sagemaker(
+    board = model_board,
+    name = "lm-model",
+    instance_type = "ml.t2.medium",
+    predict_args = list(type = "class", debug = TRUE)
 )
-vetiver_write_docker(v, port = 8080)
 
 ```
 
-
-In terminal, in directory with Dockerfile (working directory in this demo):
-
-(May need to do `export PATH=/home/sagemaker-user/.local/bin:$PATH` first)
-
-```{bash}
-
-sm-docker build . --repository sagemaker-vetiver-biv-svm:1.0 --bucket sagemaker-us-east-2-075258722956
-
-```
-
-Be sure to notice/record image URI!
-
-## Deploy image as SageMaker model
-
-```{r vetiver_sm_endpoint}
-
-## set seed here for reproducible identifier
-lm_model_identifier <- glue::glue("vetiver-sagemaker-", ids::adjective_animal(style = "kebab"))
-lm_model_identifier
-sm_model_name <- lm_model_identifier
-endpoint_config <- glue("{lm_model_identifier}-endpoint-config")
-endpoint_config
-
-```
-
-```{r vetiver_sm_deploy}
-library(paws)
-sm <- sagemaker()
-## use image URI from building:
-
-sm$create_model(
-  ModelName = sm_model_name,
-  ExecutionRoleArn = role_arn,
-  PrimaryContainer = list(
-    Image = "075258722956.dkr.ecr.us-east-2.amazonaws.com/sagemaker-vetiver-biv-svm:1.0"
-  )
-)
-
-
-sm$create_endpoint_config(
-  EndpointConfigName = endpoint_config, 
-  ProductionVariants = list(
-    list(
-      VariantName = "AllTraffic",
-      ModelName = sm_model_name,
-      InitialInstanceCount = 1,
-      InstanceType = "ml.t2.medium",
-      InitialVariantWeight = 1
-    )
-  )
-)
-
-sm$create_endpoint(
-  EndpointName = sm_model_name, 
-  EndpointConfigName = endpoint_config
-)
-```
 
